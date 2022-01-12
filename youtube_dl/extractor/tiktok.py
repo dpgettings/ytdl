@@ -2,10 +2,14 @@
 from __future__ import unicode_literals
 
 from .common import InfoExtractor
-from ..utils import (
+from ..compat import (
     compat_str,
+    compat_urllib_request,
+)
+from ..utils import (
     ExtractorError,
     float_or_none,
+    HEADRequest,
     int_or_none,
     str_or_none,
     try_get,
@@ -14,11 +18,30 @@ from ..utils import (
 
 
 class TikTokBaseIE(InfoExtractor):
+    def _download_webpage(
+            self, url_or_request, video_id, note=None, errnote=None,
+            fatal=True, tries=1, timeout=5, encoding=None, data=None,
+            headers={}, query={}, expected_status=None, setup=True):
+
+        if setup:
+            url = url_or_request.geturl() if isinstance(url_or_request, compat_urllib_request.Request) else url_or_request
+            # dummy request to set cookies
+            self._request_webpage(
+                HEADRequest(url), video_id,
+                note=False, errnote='Could not send HEAD request to %s' % url,
+                fatal=False, headers=headers)
+
+        return super(TikTokBaseIE, self)._download_webpage(
+            url_or_request, video_id, note=note, errnote=errnote,
+            fatal=fatal, tries=tries, timeout=timeout, encoding=encoding, data=data,
+            headers=headers, query=query, expected_status=expected_status)
+
     def _extract_video(self, data, video_id=None):
-        video = data['video']
-        description = str_or_none(try_get(data, lambda x: x['desc']))
-        width = int_or_none(try_get(data, lambda x: video['width']))
-        height = int_or_none(try_get(data, lambda x: video['height']))
+        video = try_get(data, lambda x: x['video'], dict)
+        if not video:
+            return
+        width = int_or_none(video.get('width'))
+        height = int_or_none(video.get('height'))
 
         format_urls = set()
         formats = []
@@ -43,30 +66,32 @@ class TikTokBaseIE(InfoExtractor):
         thumbnail = url_or_none(video.get('cover'))
         duration = float_or_none(video.get('duration'))
 
-        uploader = try_get(data, lambda x: x['author']['nickname'], compat_str)
-        uploader_id = try_get(data, lambda x: x['author']['id'], compat_str)
+        author = data.get('author')
+        if isinstance(author, dict):
+            uploader_id = author.get('id')
+        else:
+            uploader_id = data.get('authorId')
+            author = data
+        uploader = str_or_none(author.get('nickname'))
 
         timestamp = int_or_none(data.get('createTime'))
 
-        def stats(key):
-            return int_or_none(try_get(
-                data, lambda x: x['stats']['%sCount' % key]))
-
-        view_count = stats('play')
-        like_count = stats('digg')
-        comment_count = stats('comment')
-        repost_count = stats('share')
+        stats = try_get(data, lambda x: x['stats'], dict)
+        view_count, like_count, comment_count, repost_count = [
+            stats and int_or_none(stats.get('%sCount' % key))
+            for key in ('play', 'digg', 'comment', 'share', )]
 
         aweme_id = data.get('id') or video_id
 
         return {
             'id': aweme_id,
+            'display_id': video_id,
             'title': uploader or aweme_id,
-            'description': description,
+            'description': str_or_none(data.get('desc')),
             'thumbnail': thumbnail,
             'duration': duration,
             'uploader': uploader,
-            'uploader_id': uploader_id,
+            'uploader_id': str_or_none(uploader_id),
             'timestamp': timestamp,
             'view_count': view_count,
             'like_count': like_count,
@@ -84,11 +109,11 @@ class TikTokIE(TikTokBaseIE):
         'info_dict': {
             'id': '6606727368545406213',
             'ext': 'mp4',
-            'title': 'Zureeal',
+            'title': 'md5:24acc456b62b938a7e2dd88e978b20d9',
             'description': '#bowsette#mario#cosplay#uk#lgbt#gaming#asian#bowsettecosplay',
             'thumbnail': r're:^https?://.*',
             'duration': 15,
-            'uploader': 'Zureeal',
+            'uploader': 'md5:24acc456b62b938a7e2dd88e978b20d9',
             'uploader_id': '188294915489964032',
             'timestamp': 1538248586,
             'upload_date': '20180929',
@@ -99,19 +124,25 @@ class TikTokIE(TikTokBaseIE):
         }
     }]
 
-    def _real_initialize(self):
-        # Setup session (will set necessary cookies)
-        self._request_webpage(
-            'https://www.tiktok.com/', None, note='Setting up session')
-
     def _real_extract(self, url):
         video_id = self._match_id(url)
+
         webpage = self._download_webpage(url, video_id)
+
         page_props = self._parse_json(self._search_regex(
-            [r'<script[^>]+\bid=["\']__NEXT_DATA__[^>]+>\s*({.+?})\s*</script',
-             r'<script[^>]+\bid=["\']sigi-persisted-data[^>]+>(?:[^=]+=)?\s*({.+?})(?:\s*;\s*window\[.+)?</script'],
-            webpage, 'data'), video_id)
-        data = try_get(page_props, lambda x: x['ItemModule'][video_id], dict)
+            r'''(?s)<script\s[^>]*?\bid\s*=\s*(?P<q>"|'|\b)sigi-persisted-data(?P=q)[^>]*>[^=]*=\s*(?P<json>{.+?})\s*(?:;[^<]+)?</script''',
+            webpage, 'sigi data', default='{}', group='json'), video_id)
+        data = try_get(page_props, lambda x: x['ItemModule'][video_id]['video'], dict)
+        if data:
+            data = page_props['ItemModule'][video_id]
+            if data.get('privateItem'):
+                raise ExtractorError('This video is private', expected=True)
+            return self._extract_video(data, video_id)
+
+        page_props = self._parse_json(self._search_regex(
+            r'<script[^>]+\bid=["\']__NEXT_DATA__[^>]+>\s*({.+?})\s*</script',
+            webpage, 'data'), video_id)['props']['pageProps']
+        data = try_get(page_props, lambda x: x['itemInfo']['itemStruct'], dict)
         if not data and page_props.get('statusCode') == 10216:
             raise ExtractorError('This video is private', expected=True)
         return self._extract_video(data, video_id)
@@ -126,7 +157,6 @@ class TikTokUserIE(TikTokBaseIE):
         },
         'playlist_mincount': 24,
     }]
-    _WORKING = False
 
     @classmethod
     def suitable(cls, url):
@@ -134,10 +164,38 @@ class TikTokUserIE(TikTokBaseIE):
 
     def _real_extract(self, url):
         user_id = self._match_id(url)
+
+        webpage = self._download_webpage(url, user_id)
+        page_props = self._parse_json(self._search_regex(
+            r'''(?s)<script\s[^>]*?\bid\s*=\s*(?P<q>"|'|\b)sigi-persisted-data(?P=q)[^>]*>[^=]*=\s*(?P<json>{.+?})\s*(?:;[^<]+)?</script''',
+            webpage, 'sigi data', default='{}', group='json'), user_id)
+        user_data = try_get(page_props, lambda x: x['UserModule']['users'], dict)
+        entries = []
+        if user_data:
+            num_id = try_get(
+                user_data.values(),
+                lambda x: [user['id'] for user in x if user['uniqueId'] == user_id][0],
+                compat_str)
+            item_data = try_get(page_props, lambda x: x['ItemModule'], dict)
+            if item_data:
+                item_data = item_data.values()
+            for data in item_data or []:
+                if data.get('privateItem'):
+                    continue
+                item = self._extract_video(data, user_id)
+                if item:
+                    entries.append(item)
+            result = entries and self.playlist_result(entries, num_id)
+            if not result:
+                item_data = try_get(page_props, lambda x: x['ItemList']['user-post']['list'], list)
+                result = self.playlist_from_matches(item_data, playlist_id=num_id, getter=lambda m: 'tiktok:%s' % (m, ))
+            if result:
+                result['display_id'] = user_id
+                return result
+
         data = self._download_json(
             'https://m.tiktok.com/h5/share/usr/list/%s/' % user_id, user_id,
             query={'_signature': '_'})
-        entries = []
         for aweme in data['aweme_list']:
             try:
                 entry = self._extract_video(aweme)
@@ -145,4 +203,5 @@ class TikTokUserIE(TikTokBaseIE):
                 continue
             entry['extractor_key'] = TikTokIE.ie_key()
             entries.append(entry)
+
         return self.playlist_result(entries, user_id)
